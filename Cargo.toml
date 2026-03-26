@@ -1,0 +1,18 @@
+[package]
+name = "friz"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+frizbee = "0.8.3"
+crossterm = "0.29.0"
+clap = "4.6.0"
+tikv-jemallocator = "0.6.1"
+libc = "0.2"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+opt-level = 3
+strip = true
