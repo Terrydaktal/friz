@@ -3,7 +3,7 @@ use std::fs::File;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::{
     cursor,
@@ -118,7 +118,7 @@ fn main() -> io::Result<()> {
         }
     });
 
-    // 3. BACKGROUND SEARCH (Snappy memory-narrowing)
+    // 3. BACKGROUND SEARCH (Snappy memory-narrowing + CANCELLATION)
     let state_search = Arc::clone(&state);
     thread::spawn(move || {
         let mut last_query_version = 0;
@@ -140,53 +140,113 @@ fn main() -> io::Result<()> {
             if needs_search {
                 last_query_version = state_search.lock().unwrap().query_version;
 
-                let new_matches = if query.is_empty() {
+                if query.is_empty() {
                     prev_query.clear();
                     prev_matches.clear();
-                    // THE SPEED FIX: Return empty array instead of 3.2M structs
-                    Vec::new() 
-                } else {
-                    let mut refs: Vec<&str> = Vec::new();
-                    let mut global_indices: Vec<u32> = Vec::new();
+                    let mut s = state_search.lock().unwrap();
+                    if s.query_version == last_query_version {
+                        s.matches = Vec::new();
+                        s.selection_index = 0;
+                        s.ui_version += 1;
+                    }
+                    continue;
+                }
 
-                    // Search Narrowing
-                    if !prev_query.is_empty() && query.starts_with(&prev_query) && prev_matches.len() < total_len {
-                        refs.reserve(prev_matches.len());
-                        global_indices.reserve(prev_matches.len());
-                        for m in &prev_matches {
+                let mut new_matches = Vec::new();
+                let mut aborted = false;
+
+                // =======================================================
+                // THE SPEED FIX: The Abort Switch
+                // We check the Mutex. If the user typed a key, we flip 
+                // `aborted` to true and kill the search instantly!
+                // =======================================================
+                let mut check_abort = || {
+                    if state_search.lock().unwrap().query_version != last_query_version {
+                        aborted = true;
+                        true
+                    } else {
+                        false
+                    }
+                };
+
+                if !prev_query.is_empty() && query.starts_with(&prev_query) && prev_matches.len() < total_len {
+                    // NARROWED SEARCH (Chunked for cancellation)
+                    for chunk_matches in prev_matches.chunks(CHUNK_SIZE) {
+                        if check_abort() { break; } // KILL SWITCH
+
+                        let mut refs = Vec::with_capacity(chunk_matches.len());
+                        let mut global_indices = Vec::with_capacity(chunk_matches.len());
+
+                        for m in chunk_matches {
                             let chunk_idx = (m.index as usize) / CHUNK_SIZE;
                             let item_idx = (m.index as usize) % CHUNK_SIZE;
                             refs.push(chunks[chunk_idx][item_idx].as_str());
                             global_indices.push(m.index);
                         }
-                    } else {
-                        refs.reserve(total_len);
-                        for chunk in &chunks {
-                            for line in chunk.iter() {
-                                refs.push(line.as_str());
-                            }
+
+                        let local_matches = match_list_indices(&query, &refs, &Config::default());
+                        for mut m in local_matches {
+                            m.index = global_indices[m.index as usize];
+                            new_matches.push(m);
                         }
                     }
+                } else {
+                    // FULL SEARCH (Chunked for cancellation & streaming)
+                    
+                    // NEW: Track time for Progressive Rendering
+                    let mut last_flush = Instant::now(); 
 
-                    let local_matches = match_list_indices(&query, &refs, &Config::default());
+                    for (chunk_idx, chunk) in chunks.iter().enumerate() {
+                        if check_abort() { break; } // KILL SWITCH
 
-                    if !global_indices.is_empty() {
-                        local_matches.into_iter().map(|mut m| {
-                            m.index = global_indices[m.index as usize];
-                            m
-                        }).collect()
-                    } else {
-                        local_matches
+                        let refs: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
+                        let local_matches = match_list_indices(&query, &refs, &Config::default());
+
+                        for mut m in local_matches {
+                            m.index += (chunk_idx * CHUNK_SIZE) as u32;
+                            new_matches.push(m);
+                        }
+
+                        // =======================================================
+                        // THE FIRST-LETTER FIX: Progressive Rendering
+                        // If 16ms (60fps) have passed, flush the partial results 
+                        // to the UI so it feels instant to the user!
+                        // =======================================================
+                        if last_flush.elapsed() > Duration::from_millis(16) {
+                            let mut temp_matches = new_matches.clone();
+                            // Sort partials so the best matches bubble to the top instantly
+                            temp_matches.sort_unstable_by(|a, b| {
+                                b.score.cmp(&a.score).then_with(|| a.index.cmp(&b.index))
+                            });
+
+                            let mut s = state_search.lock().unwrap();
+                            if s.query_version == last_query_version {
+                                s.matches = temp_matches;
+                                // We don't reset selection_index here so we don't 
+                                // jerk the user's cursor around while streaming
+                                s.ui_version += 1;
+                            }
+                            last_flush = Instant::now();
+                        }
                     }
-                };
+                }
 
-                let mut s = state_search.lock().unwrap();
-                if s.query_version == last_query_version {
-                    s.matches = new_matches.clone();
-                    s.selection_index = 0;
-                    s.ui_version += 1;
-                    prev_matches = new_matches;
-                    prev_query = query.clone();
+                // Only finalize and save to prev_matches if fully completed!
+                if !aborted {
+                    new_matches.sort_unstable_by(|a, b| {
+                        b.score.cmp(&a.score).then_with(|| a.index.cmp(&b.index))
+                    });
+
+                    let mut s = state_search.lock().unwrap();
+                    if s.query_version == last_query_version {
+                        s.matches = new_matches.clone();
+                        s.selection_index = 0;
+                        s.ui_version += 1;
+                        
+                        // ONLY save memory if the full 3M files were searched
+                        prev_matches = new_matches;
+                        prev_query = query.clone();
+                    }
                 }
             }
         }
