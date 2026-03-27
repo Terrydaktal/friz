@@ -18,7 +18,7 @@ use tikv_jemallocator::Jemalloc;
 #[global_allocator]
 static GLOBAL: Jemalloc = Jemalloc;
 
-const CHUNK_SIZE: usize = 5000;
+const CHUNK_SIZE: usize = 20_000;
 
 // 1. CLI ARGUMENT PARSER
 #[derive(Clone)]
@@ -85,14 +85,21 @@ fn main() -> io::Result<()> {
         query_version: 0,
     }));
 
-    // 2. BACKGROUND READER (Ultra-Fast: No more Match allocations!)
+    // 2. BACKGROUND READER (Hyper-Optimized Allocations)
     let state_reader = Arc::clone(&state);
     thread::spawn(move || {
-        let reader = BufReader::new(piped_file);
+        let mut reader = BufReader::with_capacity(1024 * 1024, piped_file);
         let mut local_batch = Vec::with_capacity(CHUNK_SIZE);
+        let mut line = String::new();
 
-        for line in reader.lines().filter_map(|l| l.ok()) {
-            local_batch.push(line);
+        while let Ok(bytes_read) = reader.read_line(&mut line) {
+            if bytes_read == 0 { break; } // EOF reached
+            
+            if line.ends_with('\n') { line.pop(); }
+            if line.ends_with('\r') { line.pop(); }
+            
+            local_batch.push(line.clone());
+            line.clear();
             
             if local_batch.len() >= CHUNK_SIZE {
                 let chunk = Arc::new(local_batch);
@@ -286,15 +293,29 @@ fn main() -> io::Result<()> {
             s.ui_version
         };
 
-        if version != last_rendered_version {
+        // Grab the data, clone the Arcs, and immediately drop the lock!
+        let render_data = if version != last_rendered_version {
             let s = state.lock().unwrap();
+            Some((
+                s.query.clone(),
+                s.selection_index,
+                s.matches.clone(),
+                s.chunks.clone(),
+                s.total_len,
+            ))
+        } else {
+            None
+        };
+
+        // NOW we draw to the screen. The background reader is completely free!
+        if let Some((q, sel, matches, chunks, total_len)) = render_data {
             last_rendered_height = render(
                 &mut tty_out, 
-                &s.query, 
-                s.selection_index, 
-                &s.matches, 
-                &s.chunks, 
-                s.total_len,
+                &q, 
+                sel, 
+                &matches, 
+                &chunks, 
+                total_len,
                 last_rendered_height,
                 &app_config
             )?;
@@ -345,12 +366,23 @@ fn main() -> io::Result<()> {
                                 if s.selection_index > 0 { s.selection_index -= 1; s.ui_version += 1; }
                             }
                         }
+                        (KeyCode::Backspace, KeyModifiers::CONTROL) | (KeyCode::Char('w'), KeyModifiers::CONTROL) | (KeyCode::Char('h'), KeyModifiers::CONTROL) => {
+                            let mut new_query = s.query.trim_end_matches(|c: char| c == '/' || c == ' ').to_string();
+                            if let Some(last_pos) = new_query.rfind(|c: char| c == '/' || c == ' ') {
+                                new_query.truncate(last_pos + 1);
+                                s.query = new_query;
+                            } else {
+                                s.query.clear();
+                            }
+                            s.query_version += 1;
+                            s.ui_version += 1;
+                        }
                         (KeyCode::Backspace, _) => {
                             s.query.pop();
                             s.query_version += 1;
                             s.ui_version += 1;
                         }
-                        (KeyCode::Char(c), _) => {
+                        (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) => {
                             s.query.push(c);
                             s.query_version += 1;
                             s.ui_version += 1;
