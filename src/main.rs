@@ -85,7 +85,7 @@ fn main() -> io::Result<()> {
         query_version: 0,
     }));
 
-    // 2. BACKGROUND READER (Hyper-Optimized Allocations)
+    // 2. BACKGROUND READER (No False Aborts!)
     let state_reader = Arc::clone(&state);
     thread::spawn(move || {
         let mut reader = BufReader::with_capacity(1024 * 1024, piped_file);
@@ -93,7 +93,7 @@ fn main() -> io::Result<()> {
         let mut line = String::new();
 
         while let Ok(bytes_read) = reader.read_line(&mut line) {
-            if bytes_read == 0 { break; } // EOF reached
+            if bytes_read == 0 { break; } 
             
             if line.ends_with('\n') { line.pop(); }
             if line.ends_with('\r') { line.pop(); }
@@ -108,8 +108,7 @@ fn main() -> io::Result<()> {
                 let mut s = state_reader.lock().unwrap();
                 s.chunks.push(chunk);
                 s.total_len += CHUNK_SIZE;
-                
-                if !s.query.is_empty() { s.query_version += 1; }
+                // WE DELETED query_version += 1 HERE! 
                 s.ui_version += 1;
             }
         }
@@ -120,38 +119,44 @@ fn main() -> io::Result<()> {
             let mut s = state_reader.lock().unwrap();
             s.chunks.push(chunk);
             s.total_len += chunk_len;
-            if !s.query.is_empty() { s.query_version += 1; }
             s.ui_version += 1;
         }
     });
 
-    // 3. BACKGROUND SEARCH (Snappy memory-narrowing + CANCELLATION)
+    // 3. BACKGROUND SEARCH (Bulletproof Full-Sweep)
     let state_search = Arc::clone(&state);
     thread::spawn(move || {
         let mut last_query_version = 0;
-        let mut prev_query = String::new();
-        let mut prev_matches: Vec<MatchIndices> = Vec::new();
+        let mut last_total_len = 0;
+        let mut last_completed_query = String::new();
 
         loop {
             thread::sleep(Duration::from_millis(5));
             
-            let (needs_search, query, chunks, total_len) = {
+            let (needs_search, query, chunks, total_len, current_q_ver) = {
                 let s = state_search.lock().unwrap();
-                if s.query_version != last_query_version {
-                    (true, s.query.clone(), s.chunks.clone(), s.total_len) 
+                let q_changed = s.query_version != last_query_version;
+                let h_changed = s.total_len != last_total_len && !s.query.is_empty();
+
+                if q_changed || h_changed {
+                    (true, s.query.clone(), s.chunks.clone(), s.total_len, s.query_version) 
                 } else {
-                    (false, String::new(), Vec::new(), 0)
+                    (false, String::new(), Vec::new(), 0, 0)
                 }
             };
             
             if needs_search {
-                last_query_version = state_search.lock().unwrap().query_version;
+                last_query_version = current_q_ver;
+                last_total_len = total_len;
 
+                // THE OPTIMIZATION: Reusing this buffer prevents 3.2 million 
+                // pointer allocations per keystroke, making full sweeps lightning fast!
+                let mut refs_buffer: Vec<&str> = Vec::with_capacity(CHUNK_SIZE);
+
+                // Handle empty query instantly
                 if query.is_empty() {
-                    prev_query.clear();
-                    prev_matches.clear();
                     let mut s = state_search.lock().unwrap();
-                    if s.query_version == last_query_version {
+                    if s.query_version == current_q_ver {
                         s.matches = Vec::new();
                         s.selection_index = 0;
                         s.ui_version += 1;
@@ -162,13 +167,8 @@ fn main() -> io::Result<()> {
                 let mut new_matches = Vec::new();
                 let mut aborted = false;
 
-                // =======================================================
-                // THE SPEED FIX: The Abort Switch
-                // We check the Mutex. If the user typed a key, we flip 
-                // `aborted` to true and kill the search instantly!
-                // =======================================================
                 let mut check_abort = || {
-                    if state_search.lock().unwrap().query_version != last_query_version {
+                    if state_search.lock().unwrap().query_version != current_q_ver {
                         aborted = true;
                         true
                     } else {
@@ -176,92 +176,63 @@ fn main() -> io::Result<()> {
                     }
                 };
 
-                if !prev_query.is_empty() && query.starts_with(&prev_query) && prev_matches.len() < total_len {
-                    // NARROWED SEARCH (Chunked for cancellation)
-                    for chunk_matches in prev_matches.chunks(CHUNK_SIZE) {
-                        if check_abort() { break; } // KILL SWITCH
+                let mut last_flush = Instant::now(); 
 
-                        let mut refs = Vec::with_capacity(chunk_matches.len());
-                        let mut global_indices = Vec::with_capacity(chunk_matches.len());
+                // ALWAYS do a full sweep, safely ignoring narrowed memory!
+                for (chunk_idx, chunk) in chunks.iter().enumerate() {
+                    if check_abort() { break; } 
 
-                        for m in chunk_matches {
-                            let chunk_idx = (m.index as usize) / CHUNK_SIZE;
-                            let item_idx = (m.index as usize) % CHUNK_SIZE;
-                            refs.push(chunks[chunk_idx][item_idx].as_str());
-                            global_indices.push(m.index);
-                        }
-
-                        let local_matches = match_list_indices(&query, &refs, &Config::default());
-                        for mut m in local_matches {
-                            m.index = global_indices[m.index as usize];
-                            new_matches.push(m);
-                        }
+                    // Clear and fill the reusable buffer
+                    refs_buffer.clear();
+                    for s in chunk.iter() {
+                        refs_buffer.push(s.as_str());
                     }
-                } else {
-                    // FULL SEARCH (Chunked for cancellation & streaming)
-                    
-                    // NEW: Track time for Progressive Rendering
-                    let mut last_flush = Instant::now(); 
 
-                    for (chunk_idx, chunk) in chunks.iter().enumerate() {
-                        if check_abort() { break; } // KILL SWITCH
+                    let local_matches = match_list_indices(&query, &refs_buffer, &Config::default());
 
-                        let refs: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
-                        let local_matches = match_list_indices(&query, &refs, &Config::default());
+                    for mut m in local_matches {
+                        m.index += (chunk_idx * CHUNK_SIZE) as u32;
+                        new_matches.push(m);
+                    }
 
-                        for mut m in local_matches {
-                            m.index += (chunk_idx * CHUNK_SIZE) as u32;
-                            new_matches.push(m);
+                    // Progressive Rendering (Keeps the UI feeling instant)
+                    if last_flush.elapsed() > Duration::from_millis(16) {
+                        let mut temp_matches = new_matches.clone();
+                        temp_matches.sort_unstable_by(|a, b| {
+                            b.score.cmp(&a.score).then_with(|| a.index.cmp(&b.index))
+                        });
+
+                        let mut s = state_search.lock().unwrap();
+                        if s.query_version == current_q_ver {
+                            s.matches = temp_matches;
+                            s.ui_version += 1;
                         }
-
-                        // =======================================================
-                        // THE FIRST-LETTER FIX: Progressive Rendering
-                        // If 16ms (60fps) have passed, flush the partial results 
-                        // to the UI so it feels instant to the user!
-                        // =======================================================
-                        if last_flush.elapsed() > Duration::from_millis(16) {
-                            let mut temp_matches = new_matches.clone();
-                            // Sort partials so the best matches bubble to the top instantly
-                            temp_matches.sort_unstable_by(|a, b| {
-                                b.score.cmp(&a.score).then_with(|| a.index.cmp(&b.index))
-                            });
-
-                            let mut s = state_search.lock().unwrap();
-                            if s.query_version == last_query_version {
-                                s.matches = temp_matches;
-                                // We don't reset selection_index here so we don't 
-                                // jerk the user's cursor around while streaming
-                                s.ui_version += 1;
-                            }
-                            last_flush = Instant::now();
-                        }
+                        last_flush = Instant::now();
                     }
                 }
 
-                // Only finalize and save to prev_matches if fully completed!
                 if !aborted {
                     new_matches.sort_unstable_by(|a, b| {
                         b.score.cmp(&a.score).then_with(|| a.index.cmp(&b.index))
                     });
 
                     let mut s = state_search.lock().unwrap();
-                    if s.query_version == last_query_version {
-                        s.matches = new_matches.clone();
-                        s.selection_index = 0;
+                    if s.query_version == current_q_ver {
+                        s.matches = new_matches;
+                        // Only reset cursor if the user actually changed the text
+                        if query != last_completed_query {
+                            s.selection_index = 0;
+                        }
                         s.ui_version += 1;
-                        
-                        // ONLY save memory if the full 3M files were searched
-                        prev_matches = new_matches;
-                        prev_query = query.clone();
+                        last_completed_query = query.clone();
                     }
                 }
             }
         }
     });
 
-    // 4. TUI SETUP WITH ANCHOR FIX
+    // 4. TUI SETUP
     terminal::enable_raw_mode()?;
-    // Hide the cursor AND disable line wrapping so long paths don't break our math!
     execute!(tty_out, cursor::Hide, DisableLineWrap)?;
 
     let (_, term_height) = terminal::size()?;
@@ -271,7 +242,6 @@ fn main() -> io::Result<()> {
         (term_height as usize).saturating_sub(2).min(15)
     };
     
-    // Reserve terminal lines so the UI anchors cleanly to the bottom
     let header_lines = if app_config.header.is_some() { 1 } else { 0 };
     let reserved_lines = max_display + 2 + header_lines;
     for _ in 0..reserved_lines { write!(tty_out, "\r\n")?; }
@@ -293,7 +263,6 @@ fn main() -> io::Result<()> {
             s.ui_version
         };
 
-        // Grab the data, clone the Arcs, and immediately drop the lock!
         let render_data = if version != last_rendered_version {
             let s = state.lock().unwrap();
             Some((
@@ -307,7 +276,6 @@ fn main() -> io::Result<()> {
             None
         };
 
-        // NOW we draw to the screen. The background reader is completely free!
         if let Some((q, sel, matches, chunks, total_len)) = render_data {
             last_rendered_height = render(
                 &mut tty_out, 
@@ -335,7 +303,6 @@ fn main() -> io::Result<()> {
                         }
                         (KeyCode::Enter, _) => {
                             if total_results > 0 && s.selection_index < total_results {
-                                // Dynamically resolve the index whether query is empty or not
                                 let global_idx = if s.query.is_empty() {
                                     s.selection_index
                                 } else {
@@ -351,7 +318,6 @@ fn main() -> io::Result<()> {
                                 return Ok(());
                             }
                         }
-                        // Up/Down adapt depending on `--reverse` layout!
                         (KeyCode::Up, _) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
                             if app_config.reverse {
                                 if s.selection_index > 0 { s.selection_index -= 1; s.ui_version += 1; }
@@ -421,15 +387,12 @@ fn render<W: Write>(
     let header_lines = if config.header.is_some() { 1 } else { 0 };
     let vertical_span = display_count + 1 + header_lines;
 
-    // Clear previous frame
     queue!(w, cursor::MoveToColumn(0))?;
     if !config.reverse && last_height > 0 {
-        // Bottom-Up logic needs to move up first. Top-Down is already at the top.
         queue!(w, cursor::MoveUp(last_height as u16))?;
     }
     queue!(w, terminal::Clear(ClearType::FromCursorDown))?;
 
-    // Closure to draw a single match line
     let draw_match = |w: &mut W, i: usize| -> io::Result<()> {
         let (global_idx, char_indices) = if query.is_empty() {
             (i, &[] as &[usize])
@@ -468,7 +431,6 @@ fn render<W: Write>(
     };
 
     if config.reverse {
-        // --- TOP-DOWN LAYOUT ---
         write!(w, "> {}\r\n", query)?;
         queue!(w, style::SetForegroundColor(Color::DarkGrey))?;
         write!(w, "  {}/{} ────────────────────\r\n", total_results, total_len)?;
@@ -484,7 +446,6 @@ fn render<W: Write>(
         let end = (start + display_count).min(total_results);
         for i in start..end { draw_match(w, i)?; }
 
-        // Move cursor perfectly back up to the prompt
         queue!(
             w,
             cursor::MoveUp((vertical_span + 1) as u16),
@@ -492,7 +453,6 @@ fn render<W: Write>(
         )?;
         
     } else {
-        // --- BOTTOM-UP LAYOUT (fzf default) ---
         let start = if selection_index >= display_count { selection_index - display_count + 1 } else { 0 };
         let end = (start + display_count).min(total_results);
         
@@ -508,7 +468,7 @@ fn render<W: Write>(
         write!(w, "  {}/{} ────────────────────\r\n", total_results, total_len)?;
         queue!(w, style::ResetColor)?;
         
-        write!(w, "> {}", query)?; // No newline so cursor rests here
+        write!(w, "> {}", query)?;
     }
 
     w.flush()?;
@@ -517,11 +477,9 @@ fn render<W: Write>(
 
 fn cleanup<W: Write>(w: &mut W, last_height: usize) -> io::Result<()> {
     queue!(w, cursor::MoveToColumn(0))?;
-    // Only move up if we were in bottom-up mode and actually rendered something
     if last_height > 0 {
         queue!(w, cursor::MoveUp(last_height as u16))?;
     }
-    // Re-enable line wrap and show cursor!
     queue!(w, terminal::Clear(ClearType::FromCursorDown), cursor::Show, EnableLineWrap)?;
     w.flush()?;
     terminal::disable_raw_mode()?;
