@@ -9,6 +9,7 @@ crossterm = "0.29.0"
 clap = "4.6.0"
 tikv-jemallocator = "0.6.1"
 libc = "0.2"
+rayon = "1.11.0"
 
 [profile.release]
 lto = "fat"

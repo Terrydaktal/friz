@@ -4,6 +4,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+use rayon::prelude::*; // <-- Unleashes parallel iterators (.par_iter)
 
 use crossterm::{
     cursor,
@@ -123,7 +124,7 @@ fn main() -> io::Result<()> {
         }
     });
 
-    // 3. BACKGROUND SEARCH (Bulletproof Full-Sweep)
+    // 3. BACKGROUND SEARCH (God-Mode: Rayon Parallel Sweep)
     let state_search = Arc::clone(&state);
     thread::spawn(move || {
         let mut last_query_version = 0;
@@ -149,10 +150,6 @@ fn main() -> io::Result<()> {
                 last_query_version = current_q_ver;
                 last_total_len = total_len;
 
-                // THE OPTIMIZATION: Reusing this buffer prevents 3.2 million 
-                // pointer allocations per keystroke, making full sweeps lightning fast!
-                let mut refs_buffer: Vec<&str> = Vec::with_capacity(CHUNK_SIZE);
-
                 // Handle empty query instantly
                 if query.is_empty() {
                     let mut s = state_search.lock().unwrap();
@@ -164,62 +161,70 @@ fn main() -> io::Result<()> {
                     continue;
                 }
 
-                let mut new_matches = Vec::new();
-                let mut aborted = false;
+                // Strip spaces for the match engine
+                let search_query = query.replace(' ', "");
+                let state_search_par = Arc::clone(&state_search);
 
-                let mut check_abort = || {
-                    if state_search.lock().unwrap().query_version != current_q_ver {
-                        aborted = true;
-                        true
-                    } else {
-                        false
-                    }
-                };
-
-                let mut last_flush = Instant::now(); 
-
-                // ALWAYS do a full sweep, safely ignoring narrowed memory!
-                for (chunk_idx, chunk) in chunks.iter().enumerate() {
-                    if check_abort() { break; } 
-
-                    // Clear and fill the reusable buffer
-                    refs_buffer.clear();
-                    for s in chunk.iter() {
-                        refs_buffer.push(s.as_str());
+                // =======================================================
+                // THE CPU CAP LIMIT REMOVAL (Rayon Parallel Iteration)
+                // We map over every chunk simultaneously using all available cores!
+                // =======================================================
+                let mut new_matches: Vec<MatchIndices> = chunks.par_iter().enumerate().filter_map(|(chunk_idx, chunk)| {
+                    // Check abort flag safely across threads. (With 20k chunk sizes, 
+                    // this only locks the Mutex ~150 times, which is zero overhead).
+                    if state_search_par.lock().unwrap().query_version != current_q_ver {
+                        return None; 
                     }
 
-                    let local_matches = match_list_indices(&query, &refs_buffer, &Config::default());
+                    // Thread-local allocation (extremely fast)
+                    let refs: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
+                    let local_matches = match_list_indices(&search_query, &refs, &Config::default());
+                    
+                    let mut processed = Vec::with_capacity(local_matches.len());
 
                     for mut m in local_matches {
-                        m.index += (chunk_idx * CHUNK_SIZE) as u32;
-                        new_matches.push(m);
-                    }
-
-                    // Progressive Rendering (Keeps the UI feeling instant)
-                    if last_flush.elapsed() > Duration::from_millis(16) {
-                        let mut temp_matches = new_matches.clone();
-                        temp_matches.sort_unstable_by(|a, b| {
-                            b.score.cmp(&a.score).then_with(|| a.index.cmp(&b.index))
-                        });
-
-                        let mut s = state_search.lock().unwrap();
-                        if s.query_version == current_q_ver {
-                            s.matches = temp_matches;
-                            s.ui_version += 1;
+                        let line = refs[m.index as usize];
+                        
+                        // =======================================================
+                        // FZF Path Scoring Override
+                        // =======================================================
+                        let mut bonus: u32 = 0;
+                        let is_consecutive = m.indices.windows(2).all(|w| w[1] - w[0] == 1);
+                        if is_consecutive && m.indices.len() > 1 { bonus += 2000; }
+                        
+                        if let Some(last_slash) = line.rfind('/') {
+                            let basename_matches = m.indices.iter().filter(|&&i| (i as usize) > last_slash).count();
+                            bonus += (basename_matches as u32) * 150;
+                            if let Some(&first_idx) = m.indices.first() {
+                                if (first_idx as usize) == last_slash + 1 { bonus += 1000; }
+                            }
+                        } else {
+                            bonus += (m.indices.len() as u32) * 150;
+                            if let Some(&first_idx) = m.indices.first() {
+                                if first_idx == 0 { bonus += 1000; }
+                            }
                         }
-                        last_flush = Instant::now();
+
+                        m.score = ((m.score as u32 + bonus).min(65535)) as _;
+                        m.index += (chunk_idx * CHUNK_SIZE) as u32;
+                        processed.push(m);
                     }
-                }
+                    
+                    Some(processed)
+                }).flatten().collect();
+
+                // Final abort check before we lock UI
+                let aborted = state_search.lock().unwrap().query_version != current_q_ver;
 
                 if !aborted {
-                    new_matches.sort_unstable_by(|a, b| {
+                    // PARALLEL SORTING! Rayon drops sorting time by a massive margin.
+                    new_matches.par_sort_unstable_by(|a, b| {
                         b.score.cmp(&a.score).then_with(|| a.index.cmp(&b.index))
                     });
 
                     let mut s = state_search.lock().unwrap();
                     if s.query_version == current_q_ver {
                         s.matches = new_matches;
-                        // Only reset cursor if the user actually changed the text
                         if query != last_completed_query {
                             s.selection_index = 0;
                         }
