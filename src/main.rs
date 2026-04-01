@@ -3,7 +3,7 @@ use std::fs::File;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use rayon::prelude::*; // <-- Unleashes parallel iterators (.par_iter)
 
 use crossterm::{
@@ -161,7 +161,8 @@ fn main() -> io::Result<()> {
                     continue;
                 }
 
-                // Strip spaces for the match engine
+                // Split query into terms for Multi-Term Awareness
+                let terms: Vec<String> = query.split_whitespace().map(|s| s.to_lowercase()).collect();
                 let search_query = query.replace(' ', "");
                 let state_search_par = Arc::clone(&state_search);
 
@@ -184,28 +185,63 @@ fn main() -> io::Result<()> {
 
                     for mut m in local_matches {
                         let line = refs[m.index as usize];
+                        let line_lower = line.to_lowercase();
                         
                         // =======================================================
-                        // FZF Path Scoring Override
+                        // THE FZF SCORING SECRET (Path Awareness Engine V3)
                         // =======================================================
-                        let mut bonus: u32 = 0;
-                        let is_consecutive = m.indices.windows(2).all(|w| w[1] - w[0] == 1);
-                        if is_consecutive && m.indices.len() > 1 { bonus += 2000; }
-                        
-                        if let Some(last_slash) = line.rfind('/') {
-                            let basename_matches = m.indices.iter().filter(|&&i| (i as usize) > last_slash).count();
-                            bonus += (basename_matches as u32) * 150;
-                            if let Some(&first_idx) = m.indices.first() {
-                                if (first_idx as usize) == last_slash + 1 { bonus += 1000; }
-                            }
-                        } else {
-                            bonus += (m.indices.len() as u32) * 150;
-                            if let Some(&first_idx) = m.indices.first() {
-                                if first_idx == 0 { bonus += 1000; }
+                        let mut bonus: i32 = 0;
+
+                        // 1. TIER 1: Multi-Term Anchor Bonus (Massive)
+                        // If the path actually contains every word you typed as a substring
+                        if !terms.is_empty() {
+                            let all_terms_present = terms.iter().all(|t| line_lower.contains(t));
+                            if all_terms_present {
+                                bonus += 20000;
                             }
                         }
 
-                        m.score = ((m.score as u32 + bonus).min(65535)) as _;
+                        // 2. TIER 2: Consecutive Bonus
+                        let is_consecutive = m.indices.windows(2).all(|w| w[1] - w[0] == 1);
+                        if is_consecutive && m.indices.len() > 1 {
+                            bonus += 5000; 
+                        }
+
+                        // 3. TIER 3: Basename & Word Anchors
+                        if let Some(last_slash) = line.rfind('/') {
+                            let basename_lower = &line_lower[last_slash + 1..];
+                            
+                            // Extra points if any of our terms are in the filename itself
+                            for t in &terms {
+                                if basename_lower.contains(t) {
+                                    bonus += 2000;
+                                }
+                            }
+
+                            // How many letters matched inside the actual filename?
+                            let basename_matches = m.indices.iter().filter(|&&i| (i as usize) > last_slash).count();
+                            bonus += (basename_matches as i32) * 200;
+                        } else {
+                            // Whole string is basename
+                            for t in &terms {
+                                if line_lower.contains(t) {
+                                    bonus += 2000;
+                                }
+                            }
+                            bonus += (m.indices.len() as i32) * 200;
+                        }
+
+                        // 4. TIER 4: Path Length Penalty
+                        bonus -= (line.len() as i32) * 2;
+
+                        let final_score = (m.score as i32)
+                            .saturating_add(bonus)
+                            .max(0)
+                            .min(u16::MAX as i32) as u16;
+                        
+                        m.score = final_score;
+                        // =======================================================
+
                         m.index += (chunk_idx * CHUNK_SIZE) as u32;
                         processed.push(m);
                     }
