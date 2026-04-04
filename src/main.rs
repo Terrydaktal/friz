@@ -2,9 +2,10 @@ use std::io::{self, BufRead, BufReader, BufWriter, Write};
 use std::fs::File;
 use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 use std::time::Duration;
-use rayon::prelude::*; // <-- Unleashes parallel iterators (.par_iter)
+use rayon::prelude::*;
 
 use crossterm::{
     cursor,
@@ -13,7 +14,7 @@ use crossterm::{
     style::{self, Color},
     terminal::{self, ClearType, DisableLineWrap, EnableLineWrap},
 };
-use frizbee::{match_list_indices, Config, MatchIndices};
+use frizbee::MatchIndices;
 use tikv_jemallocator::Jemalloc;
 
 #[global_allocator]
@@ -56,13 +57,13 @@ fn parse_args() -> AppConfig {
 }
 
 struct State {
-    chunks: Vec<Arc<Vec<String>>>,
-    total_len: usize,
-    query: String,
-    matches: Vec<MatchIndices>, 
-    selection_index: usize,
-    ui_version: usize,
-    query_version: usize,
+    chunks: Mutex<Vec<Arc<Vec<String>>>>,
+    total_len: AtomicUsize,
+    query: Mutex<String>,
+    matches: Mutex<Arc<Vec<MatchIndices>>>, 
+    selection_index: AtomicUsize,
+    ui_version: AtomicUsize,
+    query_version: AtomicUsize,
 }
 
 fn main() -> io::Result<()> {
@@ -76,17 +77,17 @@ fn main() -> io::Result<()> {
 
     let mut tty_out = BufWriter::with_capacity(8192, tty_out_file);
 
-    let state = Arc::new(Mutex::new(State {
-        chunks: Vec::new(),
-        total_len: 0,
-        query: String::new(),
-        matches: Vec::new(),
-        selection_index: 0,
-        ui_version: 0,
-        query_version: 0,
-    }));
+    let state = Arc::new(State {
+        chunks: Mutex::new(Vec::new()),
+        total_len: AtomicUsize::new(0),
+        query: Mutex::new(String::new()),
+        matches: Mutex::new(Arc::new(Vec::new())),
+        selection_index: AtomicUsize::new(0),
+        ui_version: AtomicUsize::new(0),
+        query_version: AtomicUsize::new(0),
+    });
 
-    // 2. BACKGROUND READER (No False Aborts!)
+    // 2. BACKGROUND READER (Hyper-Optimized Allocations)
     let state_reader = Arc::clone(&state);
     thread::spawn(move || {
         let mut reader = BufReader::with_capacity(1024 * 1024, piped_file);
@@ -106,188 +107,135 @@ fn main() -> io::Result<()> {
                 let chunk = Arc::new(local_batch);
                 local_batch = Vec::with_capacity(CHUNK_SIZE);
                 
-                let mut s = state_reader.lock().unwrap();
-                s.chunks.push(chunk);
-                s.total_len += CHUNK_SIZE;
-                // WE DELETED query_version += 1 HERE! 
-                s.ui_version += 1;
+                {
+                    let mut chunks = state_reader.chunks.lock().unwrap();
+                    chunks.push(chunk);
+                }
+                state_reader.total_len.fetch_add(CHUNK_SIZE, Ordering::SeqCst);
+                
+                let q = state_reader.query.lock().unwrap();
+                if !q.is_empty() { 
+                    state_reader.query_version.fetch_add(1, Ordering::SeqCst); 
+                }
+                state_reader.ui_version.fetch_add(1, Ordering::SeqCst);
             }
         }
         
         if !local_batch.is_empty() {
             let chunk_len = local_batch.len();
             let chunk = Arc::new(local_batch);
-            let mut s = state_reader.lock().unwrap();
-            s.chunks.push(chunk);
-            s.total_len += chunk_len;
-            s.ui_version += 1;
+            {
+                let mut chunks = state_reader.chunks.lock().unwrap();
+                chunks.push(chunk);
+            }
+            state_reader.total_len.fetch_add(chunk_len, Ordering::SeqCst);
+            let q = state_reader.query.lock().unwrap();
+            if !q.is_empty() { 
+                state_reader.query_version.fetch_add(1, Ordering::SeqCst); 
+            }
+            state_reader.ui_version.fetch_add(1, Ordering::SeqCst);
         }
     });
 
-    // 3. BACKGROUND SEARCH (God-Mode: Rayon Parallel Sweep)
+    // 3. BACKGROUND SEARCH (Atomic-Fast Aborts)
     let state_search = Arc::clone(&state);
     thread::spawn(move || {
         let mut last_query_version = 0;
         let mut last_total_len = 0;
-        let mut last_completed_query = String::new();
 
         loop {
             thread::sleep(Duration::from_millis(5));
             
-            let (needs_search, query, chunks, total_len, current_q_ver) = {
-                let s = state_search.lock().unwrap();
-                let q_changed = s.query_version != last_query_version;
-                let h_changed = s.total_len != last_total_len && !s.query.is_empty();
+            let current_q_ver = state_search.query_version.load(Ordering::SeqCst);
+            let current_total_len = state_search.total_len.load(Ordering::SeqCst);
 
-                if q_changed || h_changed {
-                    (true, s.query.clone(), s.chunks.clone(), s.total_len, s.query_version) 
-                } else {
-                    (false, String::new(), Vec::new(), 0, 0)
-                }
-            };
-            
-            if needs_search {
+            let q_changed = current_q_ver != last_query_version;
+            let h_changed = current_total_len != last_total_len && !state_search.query.lock().unwrap().is_empty();
+
+            if q_changed || h_changed {
                 last_query_version = current_q_ver;
-                last_total_len = total_len;
+                last_total_len = current_total_len;
 
-                // Handle empty query instantly
+                let (query, chunks) = {
+                    let q = state_search.query.lock().unwrap().clone();
+                    let c = state_search.chunks.lock().unwrap().clone();
+                    (q, c)
+                };
+
                 if query.is_empty() {
-                    let mut s = state_search.lock().unwrap();
-                    if s.query_version == current_q_ver {
-                        s.matches = Vec::new();
-                        s.selection_index = 0;
-                        s.ui_version += 1;
+                    if state_search.query_version.load(Ordering::SeqCst) == current_q_ver {
+                        *state_search.matches.lock().unwrap() = Arc::new(Vec::new());
+                        state_search.selection_index.store(0, Ordering::SeqCst);
+                        state_search.ui_version.fetch_add(1, Ordering::SeqCst);
                     }
                     continue;
                 }
 
-                // Split query into terms for Multi-Term Awareness
                 let terms: Vec<String> = query.split_whitespace().map(|s| s.to_lowercase()).collect();
-                let search_query = query.replace(' ', "");
                 let state_search_par = Arc::clone(&state_search);
 
-                // =======================================================
-                // THE CPU CAP LIMIT REMOVAL (Rayon Parallel Iteration)
-                // We map over every chunk simultaneously using all available cores!
-                // =======================================================
                 let mut new_matches: Vec<MatchIndices> = chunks.par_iter().enumerate().filter_map(|(chunk_idx, chunk)| {
-                    // Check abort flag safely across threads. (With 20k chunk sizes, 
-                    // this only locks the Mutex ~150 times, which is zero overhead).
-                    if state_search_par.lock().unwrap().query_version != current_q_ver {
+                    // ATOMIC ABORT: No more Mutex locking for every chunk!
+                    if state_search_par.query_version.load(Ordering::Relaxed) != current_q_ver {
                         return None; 
                     }
 
-                    // Thread-local allocation (extremely fast)
-                    let refs: Vec<&str> = chunk.iter().map(|s| s.as_str()).collect();
-                    let local_matches = match_list_indices(&search_query, &refs, &Config::default());
-                    
-                    let mut processed = Vec::with_capacity(local_matches.len());
+                    let mut processed = Vec::new();
 
-                    for mut m in local_matches {
-                        let line = refs[m.index as usize];
+                    for (item_idx, line) in chunk.iter().enumerate() {
                         let line_lower = line.to_lowercase();
-                        
-                        // =======================================================
-                        // THE FZF SCORING SECRET (Path Awareness Engine V3)
-                        // =======================================================
-                        let mut bonus: i32 = 0;
+                        let mut all_found = true;
+                        let mut indices = Vec::new();
 
-                        // 1. TIER 1: Multi-Term Anchor Bonus (Massive)
-                        // If the path actually contains every word you typed as a substring
-                        if !terms.is_empty() {
-                            let all_terms_present = terms.iter().all(|t| line_lower.contains(t));
-                            if all_terms_present {
-                                bonus += 20000;
-                            }
-                        }
-
-                        // 2. TIER 2: Consecutive Bonus
-                        let is_consecutive = m.indices.windows(2).all(|w| w[1] - w[0] == 1);
-                        if is_consecutive && m.indices.len() > 1 {
-                            bonus += 5000; 
-                        }
-
-                        // 3. TIER 3: Basename & Word Anchors
-                        if let Some(last_slash) = line.rfind('/') {
-                            let basename_lower = &line_lower[last_slash + 1..];
+                        for part in &terms {
+                            let mut search_start = 0;
+                            let mut found_part = false;
                             
-                            // Extra points if any of our terms are in the filename itself
-                            for t in &terms {
-                                if basename_lower.contains(t) {
-                                    bonus += 2000;
+                            while let Some(pos) = line_lower[search_start..].find(part) {
+                                let actual_pos = search_start + pos;
+                                if line_lower.len() == line.len() {
+                                    for i in 0..part.len() { indices.push(actual_pos + i); }
+                                } else {
+                                    indices.push(actual_pos);
                                 }
+                                found_part = true;
+                                search_start = actual_pos + part.len();
+                                if part.is_empty() { break; }
                             }
 
-                            // How many letters matched inside the actual filename?
-                            let basename_matches = m.indices.iter().filter(|&&i| (i as usize) > last_slash).count();
-                            bonus += (basename_matches as i32) * 200;
-                        } else {
-                            // Whole string is basename
-                            for t in &terms {
-                                if line_lower.contains(t) {
-                                    bonus += 2000;
-                                }
+                            if !found_part {
+                                all_found = false;
+                                break;
                             }
-                            bonus += (m.indices.len() as i32) * 200;
                         }
 
-                        // 4. TIER 4: Path Length Penalty
-                        bonus -= (line.len() as i32) * 2;
-
-                        let final_score = (m.score as i32)
-                            .saturating_add(bonus)
-                            .max(0)
-                            .min(u16::MAX as i32) as u16;
-                        
-                        m.score = final_score;
-                        // =======================================================
-
-                        m.index += (chunk_idx * CHUNK_SIZE) as u32;
-                        processed.push(m);
+                        if all_found {
+                            indices.sort_unstable();
+                            indices.dedup();
+                            processed.push(MatchIndices {
+                                index: (chunk_idx * CHUNK_SIZE + item_idx) as u32,
+                                score: (20000f32 - (line.len() as f32)) as u16,
+                                indices,
+                                exact: true,
+                            });
+                        }
                     }
-                    
                     Some(processed)
                 }).flatten().collect();
 
-                // Final abort check before we lock UI
-                let aborted = state_search.lock().unwrap().query_version != current_q_ver;
-
-                if !aborted {
-                    // PARALLEL SORTING! Rayon drops sorting time by a massive margin.
-                    new_matches.par_sort_unstable_by(|a, b| {
-                        b.score.cmp(&a.score).then_with(|| a.index.cmp(&b.index))
-                    });
-
-                    let mut s = state_search.lock().unwrap();
-                    if s.query_version == current_q_ver {
-                        s.matches = new_matches;
-                        if query != last_completed_query {
-                            s.selection_index = 0;
-                        }
-                        s.ui_version += 1;
-                        last_completed_query = query.clone();
-                    }
+                if state_search.query_version.load(Ordering::SeqCst) == current_q_ver {
+                    new_matches.sort_unstable_by(|a, b| b.score.cmp(&a.score).then_with(|| a.index.cmp(&b.index)));
+                    *state_search.matches.lock().unwrap() = Arc::new(new_matches);
+                    state_search.selection_index.store(0, Ordering::SeqCst);
+                    state_search.ui_version.fetch_add(1, Ordering::SeqCst);
                 }
             }
         }
     });
 
-    // 4. TUI SETUP
+    // 4. TUI SETUP WITH ANCHOR FIX
     terminal::enable_raw_mode()?;
     execute!(tty_out, cursor::Hide, DisableLineWrap)?;
-
-    let (_, term_height) = terminal::size()?;
-    let max_display = if let Some(pct) = app_config.height_percent {
-        (term_height as f32 * pct).round() as usize
-    } else {
-        (term_height as usize).saturating_sub(2).min(15)
-    };
-    
-    let header_lines = if app_config.header.is_some() { 1 } else { 0 };
-    let reserved_lines = max_display + 2 + header_lines;
-    for _ in 0..reserved_lines { write!(tty_out, "\r\n")?; }
-    queue!(tty_out, cursor::MoveUp(reserved_lines as u16))?;
-    tty_out.flush()?;
 
     let mut last_rendered_height = 0;
     let mut last_rendered_version = 0;
@@ -295,29 +243,32 @@ fn main() -> io::Result<()> {
     // 5. EVENT LOOP
     loop {
         let version = {
-            let mut s = state.lock().unwrap();
-            let total_results = if s.query.is_empty() { s.total_len } else { s.matches.len() };
-            if total_results > 0 && s.selection_index >= total_results {
-                s.selection_index = total_results.saturating_sub(1);
-                s.ui_version += 1;
+            let total_results = {
+                let q = state.query.lock().unwrap();
+                if q.is_empty() { state.total_len.load(Ordering::SeqCst) } else { state.matches.lock().unwrap().len() }
+            };
+            let mut sel = state.selection_index.load(Ordering::SeqCst);
+            if total_results > 0 && sel >= total_results {
+                sel = total_results.saturating_sub(1);
+                state.selection_index.store(sel, Ordering::SeqCst);
+                state.ui_version.fetch_add(1, Ordering::SeqCst);
             }
-            s.ui_version
+            state.ui_version.load(Ordering::SeqCst)
         };
 
-        let render_data = if version != last_rendered_version {
-            let s = state.lock().unwrap();
-            Some((
-                s.query.clone(),
-                s.selection_index,
-                s.matches.clone(),
-                s.chunks.clone(),
-                s.total_len,
-            ))
-        } else {
-            None
-        };
-
-        if let Some((q, sel, matches, chunks, total_len)) = render_data {
+        if version != last_rendered_version {
+            let (q, sel, matches, chunks, total_len) = {
+                let q_val = state.query.lock().unwrap().clone();
+                let matches_val = Arc::clone(&*state.matches.lock().unwrap());
+                let chunks_val = state.chunks.lock().unwrap().clone();
+                (
+                    q_val,
+                    state.selection_index.load(Ordering::SeqCst),
+                    matches_val,
+                    chunks_val,
+                    state.total_len.load(Ordering::SeqCst),
+                )
+            };
             last_rendered_height = render(
                 &mut tty_out, 
                 &q, 
@@ -334,25 +285,23 @@ fn main() -> io::Result<()> {
         if event::poll(Duration::from_millis(5))? {
             loop {
                 if let Event::Key(KeyEvent { code, modifiers, .. }) = event::read()? {
-                    let mut s = state.lock().unwrap();
-                    let total_results = if s.query.is_empty() { s.total_len } else { s.matches.len() };
-
                     match (code, modifiers) {
                         (KeyCode::Esc, _) | (KeyCode::Char('c'), KeyModifiers::CONTROL) => {
                             cleanup(&mut tty_out, last_rendered_height)?;
                             return Ok(());
                         }
                         (KeyCode::Enter, _) => {
-                            if total_results > 0 && s.selection_index < total_results {
-                                let global_idx = if s.query.is_empty() {
-                                    s.selection_index
-                                } else {
-                                    s.matches[s.selection_index].index as usize
-                                };
-                                
+                            let (q, matches, chunks) = {
+                                (state.query.lock().unwrap().clone(), Arc::clone(&*state.matches.lock().unwrap()), state.chunks.lock().unwrap().clone())
+                            };
+                            let total_results = if q.is_empty() { state.total_len.load(Ordering::SeqCst) } else { matches.len() };
+                            let sel = state.selection_index.load(Ordering::SeqCst);
+
+                            if total_results > 0 && sel < total_results {
+                                let global_idx = if q.is_empty() { sel } else { matches[sel].index as usize };
                                 let chunk_idx = global_idx / CHUNK_SIZE;
                                 let item_idx = global_idx % CHUNK_SIZE;
-                                let selected = s.chunks[chunk_idx][item_idx].clone();
+                                let selected = chunks[chunk_idx][item_idx].clone();
                                 
                                 cleanup(&mut tty_out, last_rendered_height)?;
                                 println!("{}", selected);
@@ -360,39 +309,52 @@ fn main() -> io::Result<()> {
                             }
                         }
                         (KeyCode::Up, _) | (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
+                            let total_results = {
+                                let q = state.query.lock().unwrap();
+                                if q.is_empty() { state.total_len.load(Ordering::SeqCst) } else { state.matches.lock().unwrap().len() }
+                            };
+                            let sel = state.selection_index.load(Ordering::SeqCst);
                             if app_config.reverse {
-                                if s.selection_index > 0 { s.selection_index -= 1; s.ui_version += 1; }
+                                if sel > 0 { state.selection_index.store(sel - 1, Ordering::SeqCst); state.ui_version.fetch_add(1, Ordering::SeqCst); }
                             } else {
-                                if s.selection_index + 1 < total_results { s.selection_index += 1; s.ui_version += 1; }
+                                if sel + 1 < total_results { state.selection_index.store(sel + 1, Ordering::SeqCst); state.ui_version.fetch_add(1, Ordering::SeqCst); }
                             }
                         }
                         (KeyCode::Down, _) | (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+                            let total_results = {
+                                let q = state.query.lock().unwrap();
+                                if q.is_empty() { state.total_len.load(Ordering::SeqCst) } else { state.matches.lock().unwrap().len() }
+                            };
+                            let sel = state.selection_index.load(Ordering::SeqCst);
                             if app_config.reverse {
-                                if s.selection_index + 1 < total_results { s.selection_index += 1; s.ui_version += 1; }
+                                if sel + 1 < total_results { state.selection_index.store(sel + 1, Ordering::SeqCst); state.ui_version.fetch_add(1, Ordering::SeqCst); }
                             } else {
-                                if s.selection_index > 0 { s.selection_index -= 1; s.ui_version += 1; }
+                                if sel > 0 { state.selection_index.store(sel - 1, Ordering::SeqCst); state.ui_version.fetch_add(1, Ordering::SeqCst); }
                             }
                         }
                         (KeyCode::Backspace, KeyModifiers::CONTROL) | (KeyCode::Char('w'), KeyModifiers::CONTROL) | (KeyCode::Char('h'), KeyModifiers::CONTROL) => {
-                            let mut new_query = s.query.trim_end_matches(|c: char| c == '/' || c == ' ').to_string();
+                            let mut q = state.query.lock().unwrap();
+                            let mut new_query = q.trim_end_matches(|c: char| c == '/' || c == ' ').to_string();
                             if let Some(last_pos) = new_query.rfind(|c: char| c == '/' || c == ' ') {
                                 new_query.truncate(last_pos + 1);
-                                s.query = new_query;
+                                *q = new_query;
                             } else {
-                                s.query.clear();
+                                q.clear();
                             }
-                            s.query_version += 1;
-                            s.ui_version += 1;
+                            state.query_version.fetch_add(1, Ordering::SeqCst);
+                            state.ui_version.fetch_add(1, Ordering::SeqCst);
                         }
                         (KeyCode::Backspace, _) => {
-                            s.query.pop();
-                            s.query_version += 1;
-                            s.ui_version += 1;
+                            let mut q = state.query.lock().unwrap();
+                            q.pop();
+                            state.query_version.fetch_add(1, Ordering::SeqCst);
+                            state.ui_version.fetch_add(1, Ordering::SeqCst);
                         }
                         (KeyCode::Char(c), m) if !m.contains(KeyModifiers::CONTROL) && !m.contains(KeyModifiers::ALT) => {
-                            s.query.push(c);
-                            s.query_version += 1;
-                            s.ui_version += 1;
+                            let mut q = state.query.lock().unwrap();
+                            q.push(c);
+                            state.query_version.fetch_add(1, Ordering::SeqCst);
+                            state.ui_version.fetch_add(1, Ordering::SeqCst);
                         }
                         _ => {}
                     }
@@ -426,10 +388,11 @@ fn render<W: Write>(
     let display_count = total_results.min(max_display);
     
     let header_lines = if config.header.is_some() { 1 } else { 0 };
-    let vertical_span = display_count + 1 + header_lines;
+    let vertical_span = display_count + 2 + header_lines; // +2 for Prompt and Info Line
 
+    // Clear previous frame
     queue!(w, cursor::MoveToColumn(0))?;
-    if !config.reverse && last_height > 0 {
+    if last_height > 0 {
         queue!(w, cursor::MoveUp(last_height as u16))?;
     }
     queue!(w, terminal::Clear(ClearType::FromCursorDown))?;
@@ -471,10 +434,20 @@ fn render<W: Write>(
         Ok(())
     };
 
+    let count_info = format!("{}/{}", total_results, total_len);
+    let info_width: usize = 30; // Fixed width for the count + dashes
+    let dash_count = info_width.saturating_sub(count_info.len());
+    let dashes: String = "─".repeat(dash_count);
+
     if config.reverse {
         write!(w, "> {}\r\n", query)?;
+        
+        // Render Info Line (White count, Grey dashes)
+        write!(w, "  ")?;
+        queue!(w, style::SetForegroundColor(Color::White))?;
+        write!(w, "{}", count_info)?;
         queue!(w, style::SetForegroundColor(Color::DarkGrey))?;
-        write!(w, "  {}/{} ────────────────────\r\n", total_results, total_len)?;
+        write!(w, " {}\r\n", dashes)?;
         queue!(w, style::ResetColor)?;
         
         if let Some(header) = &config.header {
@@ -486,12 +459,6 @@ fn render<W: Write>(
         let start = if selection_index >= display_count { selection_index - display_count + 1 } else { 0 };
         let end = (start + display_count).min(total_results);
         for i in start..end { draw_match(w, i)?; }
-
-        queue!(
-            w,
-            cursor::MoveUp((vertical_span + 1) as u16),
-            cursor::MoveToColumn((query.len() + 2) as u16)
-        )?;
         
     } else {
         let start = if selection_index >= display_count { selection_index - display_count + 1 } else { 0 };
@@ -505,15 +472,24 @@ fn render<W: Write>(
             queue!(w, style::ResetColor)?;
         }
 
+        // Render Info Line (White count, Grey dashes)
+        write!(w, "  ")?;
+        queue!(w, style::SetForegroundColor(Color::White))?;
+        write!(w, "{}", count_info)?;
         queue!(w, style::SetForegroundColor(Color::DarkGrey))?;
-        write!(w, "  {}/{} ────────────────────\r\n", total_results, total_len)?;
+        write!(w, " {}\r\n", dashes)?;
         queue!(w, style::ResetColor)?;
         
         write!(w, "> {}", query)?;
     }
 
     w.flush()?;
-    Ok(vertical_span)
+    
+    if config.reverse {
+        Ok(vertical_span)
+    } else {
+        Ok(vertical_span - 1)
+    }
 }
 
 fn cleanup<W: Write>(w: &mut W, last_height: usize) -> io::Result<()> {
@@ -521,7 +497,8 @@ fn cleanup<W: Write>(w: &mut W, last_height: usize) -> io::Result<()> {
     if last_height > 0 {
         queue!(w, cursor::MoveUp(last_height as u16))?;
     }
-    queue!(w, terminal::Clear(ClearType::FromCursorDown), cursor::Show, EnableLineWrap)?;
+    queue!(w, terminal::Clear(ClearType::FromCursorDown))?;
+    queue!(w, cursor::Show, EnableLineWrap)?;
     w.flush()?;
     terminal::disable_raw_mode()?;
     Ok(())
