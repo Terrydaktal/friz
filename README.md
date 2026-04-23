@@ -1,80 +1,75 @@
 # friz
 
-An ultrafast, lightweight fuzzy finder built with Rust and the SIMD-accelerated `frizbee` library. Designed as a drop-in replacement for `fzf` in simple pipe workflows.
+`friz` is a fast interactive line selector for shell pipelines.
+It reads candidate lines from `stdin`, uses `/dev/tty` for interaction, and prints the selected line to `stdout`.
 
-## Features
-- **SIMD-accelerated:** Uses `frizbee` for high-performance fuzzy matching based on the Smith-Waterman algorithm.
-- **Lightweight:** Minimal dependencies, focused on speed.
-- **TTY-aware:** Reads from stdin for the list, but uses `/dev/tty` for interactive input, making it perfect for shell pipes.
-- **Flexible UI:** Supports both Bottom-Up (default) and Top-Down (`--reverse`) layouts, with customizable height and headers.
-- **Cancellable Search:** Sub-millisecond search cancellation via chunked processing (20,000 lines/chunk).
-- **Progressive Rendering:** 60fps streaming updates for large datasets, providing instantaneous visual feedback.
-- **High Performance:** Uses `jemalloc` for efficient memory management and a non-blocking architecture that decouples rendering from data ingestion.
-
-## Keyboard Shortcuts
-- **Enter**: Select the current item.
-- **Esc / Ctrl+C**: Exit without selecting.
-- **Up / Ctrl+P**: Move selection up.
-- **Down / Ctrl+N**: Move selection down.
-- **Ctrl+W / Ctrl+Backspace**: Delete the last word (back to `/` or space).
-- **Backspace**: Delete the last character.
+## Current Behavior
+- Case-insensitive, multi-term substring matching.
+- Query is split by whitespace; each term must be present for a line to match.
+- Progressive ingestion of large inputs in `20,000`-line chunks.
+- Parallel search across chunks with `rayon`.
+- In-place terminal rendering with both default and `--reverse` layouts.
+- `jemalloc` as global allocator for high-churn workloads.
 
 ## Project Structure
 
 ```text
 .
-├── .gitignore          # Git ignore rules
-├── Cargo.lock          # Locked dependencies
-├── Cargo.toml          # Rust project configuration
-├── README.md           # Project documentation
-└── src/
-    └── main.rs         # Core logic: TUI, matching, and selection
+├── .gitignore
+├── Cargo.lock
+├── Cargo.toml
+├── README.md
+└── src
+    └── main.rs
 ```
 
-- `src/main.rs`: Contains the entire application logic including CLI argument parsing, background stdin reading, search narrowing, and the cross-platform TUI renderer.
+- `src/main.rs`: Full application pipeline (arg parsing, stdin ingestion, background search, TUI rendering, key handling, and selection output).
 
 ## Installation
 
 ```bash
 cargo build --release
-sudo cp target/release/friz /usr/local/bin/
+cp target/release/friz ~/.local/bin/friz
 ```
+
+## Inputs and Outputs
+- Input: newline-delimited candidates from `stdin`.
+- Interactive control: keyboard events from `/dev/tty`.
+- Output on `Enter`: selected line written to `stdout`.
+- Output on `Esc` / `Ctrl+C`: no selection printed.
 
 ## Usage
 
-Pipe any list of strings to `friz`:
-
 ```bash
-ls | friz
 find . -type f | friz
+find . -maxdepth 4 | friz --reverse --height 40% --header="Select path"
 ```
 
-### Options
-- `--reverse`: Use Top-Down layout.
-- `--height <N>%`: Set the TUI height as a percentage of terminal height.
-- `--header "<text>"`: Add a header string above/below the search prompt.
+## CLI Options
+- `--reverse`: top-down layout (prompt first, results below).
+- `--height <N>` or `--height=<N>`: list height as percent of terminal height (`40` and `40%` are both accepted).
+- `--header=<text>`: optional header line.
 
-### Keybindings (Zsh)
+Note: header parsing is currently `--header=<text>` form.
 
-Add the following to your `.zshrc` to bind `friz` to `Ctrl+T` (find file and insert into command line):
+## Keyboard Shortcuts
+- `Enter`: accept selection.
+- `Esc` or `Ctrl+C`: cancel.
+- `Up` or `Ctrl+P`: move selection up.
+- `Down` or `Ctrl+N`: move selection down.
+- `Backspace`: delete one character.
+- `Ctrl+W`, `Ctrl+Backspace`, or `Ctrl+H`: delete previous segment up to `/` or space.
 
-```zsh
-friz-file-widget() {
-  local selected=$(find . -maxdepth 4 | friz)
-  if [ -n "$selected" ]; then
-    LBUFFER="${LBUFFER}${selected}"
-  fi
-  zle reset-prompt
-}
-zle -N friz-file-widget
-bindkey '^T' friz-file-widget
-```
+## Pipeline Order
+1. Parse CLI flags.
+2. Open `/dev/tty` for interactive input/output while preserving piped `stdin`.
+3. Reader thread streams input lines into chunk storage.
+4. Search thread recomputes matches when query/data versions change.
+5. Render loop updates the TUI when state version changes.
+6. On `Enter`, print selected line and clean up terminal state.
 
-## Implementation Details
-
-`friz` leverages several advanced techniques for performance:
-1. **Hyper-Optimized Reading:** Uses a 1MB `BufReader` and a reusable `String` buffer to minimize system I/O calls and heap allocations.
-2. **Search Narrowing:** If a new query starts with the previous query, it only searches within the previous results.
-3. **Non-Blocking Render Loop:** State is cloned and the lock is dropped before terminal I/O, ensuring data ingestion and search are never blocked by rendering.
-4. **Jemalloc:** Uses `tikv-jemallocator` for better performance under high allocation churn.
-5. **Direct TTY Access:** Opens `/dev/tty` for input/output to allow usage in shell pipelines where `stdin` is already consumed.
+## Implementation Notes
+- Shared state uses fine-grained `Mutex` + `AtomicUsize` fields to reduce lock contention.
+- Search aborts stale work using atomic query version checks.
+- Result ordering is deterministic: score then source index.
+- Rendering clears previous frame by tracked height to avoid progressive frame stacking.

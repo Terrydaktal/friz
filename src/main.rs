@@ -410,7 +410,8 @@ fn render<W: Write>(
         let line = &chunks[chunk_idx][item_idx];
         
         if i == selection_index {
-            queue!(w, style::SetForegroundColor(Color::Red))?; 
+            queue!(w, style::SetForegroundColor(Color::Blue))?;
+            queue!(w, style::SetAttribute(style::Attribute::Bold))?;
             write!(w, "> ")?;
         } else {
             write!(w, "  ")?;
@@ -421,7 +422,7 @@ fn render<W: Write>(
                 queue!(w, style::SetForegroundColor(Color::Red))?;
                 write!(w, "{}", c)?;
                 if i == selection_index {
-                    queue!(w, style::SetForegroundColor(Color::Red))?;
+                    queue!(w, style::SetForegroundColor(Color::Blue))?;
                 } else {
                     queue!(w, style::ResetColor)?;
                 }
@@ -430,6 +431,7 @@ fn render<W: Write>(
             }
         }
         write!(w, "\r\n")?;
+        queue!(w, style::SetAttribute(style::Attribute::Reset))?;
         queue!(w, style::ResetColor)?;
         Ok(())
     };
