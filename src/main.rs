@@ -212,9 +212,31 @@ fn main() -> io::Result<()> {
                         if all_found {
                             indices.sort_unstable();
                             indices.dedup();
+
+                            // Prioritize paths whose final segment (file/final dir name)
+                            // contains one or more query terms.
+                            let trimmed = line_lower.trim_end_matches('/');
+                            let tail = if trimmed.is_empty() {
+                                line_lower.as_str()
+                            } else {
+                                trimmed.rsplit('/').next().unwrap_or(trimmed)
+                            };
+                            let tail_term_hits = terms
+                                .iter()
+                                .filter(|part| !part.is_empty() && tail.contains(part.as_str()))
+                                .count() as i32;
+                            let tail_bonus = if tail_term_hits > 0 {
+                                4000 + (tail_term_hits - 1) * 1500
+                            } else {
+                                0
+                            };
+                            let base_score = 20000i32.saturating_sub(line.len() as i32);
+                            let final_score =
+                                (base_score + tail_bonus).clamp(0, u16::MAX as i32) as u16;
+
                             processed.push(MatchIndices {
                                 index: (chunk_idx * CHUNK_SIZE + item_idx) as u32,
-                                score: (20000f32 - (line.len() as f32)) as u16,
+                                score: final_score,
                                 indices,
                                 exact: true,
                             });
@@ -386,6 +408,11 @@ fn render<W: Write>(
 
     let total_results = if query.is_empty() { total_len } else { matches.len() };
     let display_count = total_results.min(max_display);
+    let query_terms: Vec<String> = query
+        .split_whitespace()
+        .filter(|part| !part.is_empty())
+        .map(|part| part.to_lowercase())
+        .collect();
     
     let header_lines = if config.header.is_some() { 1 } else { 0 };
     let vertical_span = display_count + 2 + header_lines; // +2 for Prompt and Info Line
@@ -408,9 +435,31 @@ fn render<W: Write>(
         let chunk_idx = global_idx / CHUNK_SIZE;
         let item_idx = global_idx % CHUNK_SIZE;
         let line = &chunks[chunk_idx][item_idx];
+        let is_selected = i == selection_index;
+        let has_basename_term = if query_terms.is_empty() {
+            true
+        } else {
+            let line_lower = line.to_lowercase();
+            let trimmed = line_lower.trim_end_matches('/');
+            let tail = if trimmed.is_empty() {
+                line_lower.as_str()
+            } else {
+                trimmed.rsplit('/').next().unwrap_or(trimmed)
+            };
+            query_terms
+                .iter()
+                .any(|term| tail.contains(term.as_str()))
+        };
+        let base_color = if is_selected {
+            Color::Rgb { r: 255, g: 255, b: 255 } // #ffffff
+        } else if !has_basename_term {
+            Color::Rgb { r: 107, g: 107, b: 107 } // #6b6b6b
+        } else {
+            Color::Rgb { r: 209, g: 209, b: 209 } // #d1d1d1
+        };
         
-        if i == selection_index {
-            queue!(w, style::SetForegroundColor(Color::Blue))?;
+        queue!(w, style::SetForegroundColor(base_color))?;
+        if is_selected {
             queue!(w, style::SetAttribute(style::Attribute::Bold))?;
             write!(w, "> ")?;
         } else {
@@ -421,11 +470,7 @@ fn render<W: Write>(
             if char_indices.contains(&char_idx) {
                 queue!(w, style::SetForegroundColor(Color::Red))?;
                 write!(w, "{}", c)?;
-                if i == selection_index {
-                    queue!(w, style::SetForegroundColor(Color::Blue))?;
-                } else {
-                    queue!(w, style::ResetColor)?;
-                }
+                queue!(w, style::SetForegroundColor(base_color))?;
             } else {
                 write!(w, "{}", c)?;
             }
